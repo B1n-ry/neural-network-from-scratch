@@ -1,22 +1,23 @@
-use std::{array::from_fn, f32::consts::E, time::SystemTime};
+use std::{array::from_fn, f32::consts::E};
 
 use rand::{rngs::ThreadRng, thread_rng, Rng};
+use itertools::izip;
+
 use idx_parsing::IdxFile;
 
 use rayon::prelude::*;
+
+/* use rustacuda::prelude::*; */
 
 mod idx_parsing;
 
 
 const N_THREADS: usize = 200;
 
-
-
 #[derive(Clone, Copy)]
 struct NeuralNode<const N: usize> {
     weights: [f32; N],
     bias: f32,
-    value: f32,
 }
 impl<const N: usize> NeuralNode<N> {
     fn with_random_weights_and_bias(rng: &mut ThreadRng) -> NeuralNode<N> {
@@ -31,7 +32,6 @@ impl<const N: usize> NeuralNode<N> {
         NeuralNode {
             weights: weights,
             bias: rng.gen_range(-limit..limit),
-            value: 0.0,
         }
     }
 }
@@ -57,41 +57,49 @@ impl NeuralNetwork {
         }
     }
 
-    fn run_calc(&mut self, input: &Vec<f32>) {
-        for node in &mut self.layers.0 {
-            node.value = input.iter()
+    fn run_calc(&self, input: &Vec<f32>) -> Vec<f32> {
+        let mut node_values: (Vec<f32>, Vec<f32>, Vec<f32>) = (
+            vec![0.0; self.layers.0.len()],
+            vec![0.0; self.layers.1.len()],
+            vec![0.0; self.layers.2.len()],
+        );
+
+        for (node, val) in &mut self.layers.0.iter().zip(&mut node_values.0) {
+            *val = input.iter()
                 .zip(node.weights.iter())
                 .map(|(i, w)| i * w)
                 .sum::<f32>();
-            node.value += node.bias;
+            *val += node.bias;
     
-            node.value = signmoid(node.value);
+            *val = signmoid(*val);
         }
-        for node in &mut self.layers.1 {
-            node.value = self.layers.0.iter()
+        for (node, val) in &mut self.layers.1.iter().zip(&mut node_values.1) {
+            *val = node_values.0.iter()
                 .zip(node.weights.iter())
-                .map(|(n, w)| n.value * w)
+                .map(|(v, w)| v * w)
                 .sum::<f32>();
-            node.value += node.bias;
+            *val += node.bias;
     
-            node.value = signmoid(node.value);
+            *val = signmoid(*val);
         }
-        for node in &mut self.layers.2 {
-            node.value = self.layers.1.iter()
+        for (node, val) in &mut self.layers.2.iter().zip(&mut node_values.2) {
+            *val = node_values.1.iter()
                 .zip(node.weights.iter())
-                .map(|(n, w)| n.value * w)
+                .map(|(v, w)| v * w)
                 .sum::<f32>();
-            node.value += node.bias;
+            *val += node.bias;
     
-            node.value = signmoid(node.value);
+            *val = signmoid(*val);
         }
+
+        node_values.2
     }
-    fn calc_cost(&self, correct: u8) -> f32 {
-        let result: [f32; 10] = self.layers.2.map(|n| n.value);
+
+    fn calc_cost(&self, correct: u8, net_result: &Vec<f32>) -> f32 {
         let expected: [f32; 10] = from_fn(|i| i).map(|v| (v as u8 == correct) as u8 as f32);
     
         let sum = expected.iter()
-            .zip(result.iter())
+            .zip(net_result.iter())
             .map(|(e, r)| (e - r).powi(2))
             .sum::<f32>();
 
@@ -103,38 +111,41 @@ fn signmoid(i: f32) -> f32 {
     1.0 / (1.0 + E.powf(-i))
 }
 
-fn run_slice(images: &IdxFile, labels: &IdxFile, costs: &mut [f32]) {
-    for i in 0..costs.len() {
-        let mut input: Vec<f32> = vec![];
+fn run_once(image: &Vec<u8>, label: u8, network: &NeuralNetwork) -> f32 {
+    let mut input: Vec<f32> = vec![];
 
-        for d in images.get_image(i) {
-            input.push(d as f32 / 255.0);
-        }
-
-        let correct = labels.get_byte(i);
-
-        let mut network: NeuralNetwork = NeuralNetwork::random();
-
-        network.run_calc(&input);
-
-        let cost = network.calc_cost(correct);
-        
-        costs[i] = cost;
+    for &d in image {
+        input.push(d as f32 / 255.0);
     }
+
+    let result = network.run_calc(&input);
+
+    network.calc_cost(label, &result)
 }
 
 fn main() {
+    let dataset_size = 60000;
+    
     let images: IdxFile = IdxFile::load("mnist/train-images.idx3-ubyte");
     let labels: IdxFile = IdxFile::load("mnist/train-labels.idx1-ubyte");
 
-    let mut costs: Vec<f32> = vec![0.0; labels.data.len()];
-    let chunk_size = costs.len() / N_THREADS;
+    let chunk_size = dataset_size / N_THREADS;
 
-    costs.par_chunks_mut(chunk_size).for_each(|slice| {
-        run_slice(&images, &labels, slice);
+    let mut all_data: Vec<(f32, Vec<u8>, u8)> = izip!(
+        vec![0.0; dataset_size],
+        (0..dataset_size).map(|i| images.get_image(i)),
+        (0..dataset_size).map(|i| labels.get_byte(i))
+    ).collect();
+    
+    let network: NeuralNetwork = NeuralNetwork::random();
+
+    all_data.par_chunks_mut(chunk_size).for_each(|slice| {
+        for s in slice {
+            s.0 = run_once(&s.1, s.2, &network);
+        }
     });
 
-    let avg_cost = costs.iter().sum::<f32>() / costs.len() as f32;
+    let avg_cost = all_data.iter().map(|t| t.0).sum::<f32>() / dataset_size as f32;
 
     println!("Avg: {}", avg_cost);
 }
