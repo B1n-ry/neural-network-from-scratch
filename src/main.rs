@@ -1,24 +1,25 @@
-use std::{array::from_fn, f32::consts::E};
+#[macro_use]
+extern crate rustacuda;
+extern crate rustacuda_core;
 
+use std::{array::from_fn, error::Error, f32::consts::E, ffi::CString, ops::Deref};
 use rand::{rngs::ThreadRng, thread_rng, Rng};
 use itertools::izip;
-
 use idx_parsing::IdxFile;
-
 use rayon::prelude::*;
-
-/* use rustacuda::prelude::*; */
+use rustacuda::{memory::DeviceBox, prelude::*};
+use rustacuda_core::DeviceCopy;
 
 mod idx_parsing;
 
-
 const N_THREADS: usize = 200;
 
-#[derive(Clone, Copy)]
+#[repr(C)]
 struct NeuralNode<const N: usize> {
     weights: [f32; N],
     bias: f32,
 }
+
 impl<const N: usize> NeuralNode<N> {
     fn with_random_weights_and_bias(rng: &mut ThreadRng) -> NeuralNode<N> {
 
@@ -35,7 +36,6 @@ impl<const N: usize> NeuralNode<N> {
         }
     }
 }
-
 
 struct NeuralNetwork {
     layers: (
@@ -105,6 +105,34 @@ impl NeuralNetwork {
 
         sum
     }
+
+    fn as_vec(&self) -> Vec<f32> {
+        let mut vector = vec![];
+
+        for node in &self.layers.0 {
+            vector.push(node.bias);
+
+            for w in node.weights {
+                vector.push(w);
+            }
+        }
+        for node in &self.layers.1 {
+            vector.push(node.bias);
+
+            for w in node.weights {
+                vector.push(w);
+            }
+        }
+        for node in &self.layers.2 {
+            vector.push(node.bias);
+
+            for w in node.weights {
+                vector.push(w);
+            }
+        }
+
+        vector
+    }
 }
 
 fn signmoid(i: f32) -> f32 {
@@ -123,29 +151,75 @@ fn run_once(image: &Vec<u8>, label: u8, network: &NeuralNetwork) -> f32 {
     network.calc_cost(label, &result)
 }
 
+fn cuda_parallelize(images: &Vec<u8>, labels: &Vec<u8>, network: &NeuralNetwork, dataset_size: usize) -> Result<f32, Box<dyn Error>> {
+    rustacuda::init(CudaFlags::empty())?;
+
+    let gpu = Device::get_device(0)?;
+    
+    let context = Context::create_and_push(
+        ContextFlags::MAP_HOST | ContextFlags::SCHED_AUTO, gpu)?;
+
+    let module_data = CString::new(include_str!("../cuda/img_result.ptx"))?;
+    let module = Module::load_from_string(&module_data)?;
+
+    let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
+
+    let mut result_host = vec![0.0f32; dataset_size];
+
+    let mut img_ptr = DeviceBuffer::from_slice(images.as_slice())?;
+    let mut label_ptr = DeviceBuffer::from_slice(labels.as_slice())?;
+    let mut network_ptr = DeviceBuffer::from_slice(network.as_vec().as_slice())?;
+    let mut cost_ptr = DeviceBuffer::from_slice(result_host.as_slice())?;
+
+    unsafe {
+        launch!(module.img_result<<<1, 30, 0, stream>>>(
+            img_ptr.as_device_ptr(),
+            label_ptr.as_device_ptr(),
+            network_ptr.as_device_ptr(),
+            cost_ptr.as_device_ptr()
+        ))?;
+    }
+
+    stream.synchronize()?;
+
+    let avg = result_host.iter().sum::<f32>() / dataset_size as f32;
+    println!("{}", avg);
+
+    cost_ptr.copy_to(&mut result_host.as_mut_slice())?;
+    
+
+    let avg = result_host.iter().sum::<f32>() / dataset_size as f32;
+
+    Ok(avg)
+}
+
 fn main() {
-    let dataset_size = 60000;
+    let dataset_size = 30;
     
     let images: IdxFile = IdxFile::load("mnist/train-images.idx3-ubyte");
     let labels: IdxFile = IdxFile::load("mnist/train-labels.idx1-ubyte");
+    
+    let network: NeuralNetwork = NeuralNetwork::random();
 
-    let chunk_size = dataset_size / N_THREADS;
+    let avg = cuda_parallelize(&images.data, &labels.data, &network, dataset_size).unwrap();
+
+    println!("{}", avg);
+
+    /* let chunk_size = dataset_size / N_THREADS;
 
     let mut all_data: Vec<(f32, Vec<u8>, u8)> = izip!(
         vec![0.0; dataset_size],
         (0..dataset_size).map(|i| images.get_image(i)),
         (0..dataset_size).map(|i| labels.get_byte(i))
     ).collect();
-    
-    let network: NeuralNetwork = NeuralNetwork::random();
 
     all_data.par_chunks_mut(chunk_size).for_each(|slice| {
         for s in slice {
             s.0 = run_once(&s.1, s.2, &network);
         }
     });
-
+    
     let avg_cost = all_data.iter().map(|t| t.0).sum::<f32>() / dataset_size as f32;
 
-    println!("Avg: {}", avg_cost);
+    println!("Avg: {}", avg_cost); */
 }
