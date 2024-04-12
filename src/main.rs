@@ -1,20 +1,13 @@
-#[macro_use]
-extern crate rustacuda;
-extern crate rustacuda_core;
-
-use std::{array::from_fn, error::Error, f32::consts::E, ffi::CString, ops::Deref};
+use std::{array::from_fn, error::Error, f32::consts::E, path::Path};
+use cudarc::{driver::{LaunchAsync, LaunchConfig}, nvrtc::Ptx};
 use rand::{rngs::ThreadRng, thread_rng, Rng};
-use itertools::izip;
 use idx_parsing::IdxFile;
-use rayon::prelude::*;
-use rustacuda::{memory::DeviceBox, prelude::*};
-use rustacuda_core::DeviceCopy;
+
 
 mod idx_parsing;
 
 const N_THREADS: usize = 200;
 
-#[repr(C)]
 struct NeuralNode<const N: usize> {
     weights: [f32; N],
     bias: f32,
@@ -151,59 +144,42 @@ fn run_once(image: &Vec<u8>, label: u8, network: &NeuralNetwork) -> f32 {
     network.calc_cost(label, &result)
 }
 
-fn cuda_parallelize(images: &Vec<u8>, labels: &Vec<u8>, network: &NeuralNetwork, dataset_size: usize) -> Result<f32, Box<dyn Error>> {
-    rustacuda::init(CudaFlags::empty())?;
+fn cuda_parallelize(images: Vec<u8>, labels: Vec<u8>, network: &NeuralNetwork, dataset_size: usize) -> Result<f32, Box<dyn Error>> {
+    let gpu = cudarc::driver::CudaDevice::new(0)?;
 
-    let gpu = Device::get_device(0)?;
+    // allocate buffers
+    let image_slice = gpu.htod_copy(images[0..dataset_size].to_vec())?;
+    let label_slice = gpu.htod_copy(labels[0..dataset_size].to_vec())?;
+
+    let network_vec = network.as_vec();
+    let network_slice = gpu.htod_copy(network_vec)?;
+    let mut out = gpu.alloc_zeros::<f32>(dataset_size)?;
+
+    let ptx_file = Ptx::from_file("./cuda/img_result.ptx");
+    gpu.load_ptx(ptx_file, "neural01", &["img_result"])?;
+
+    let img_result = gpu.get_func("neural01", "img_result").unwrap();
+    let config = LaunchConfig::for_num_elems(dataset_size as u32);
+    unsafe { img_result.launch(config, (&image_slice, &label_slice, &network_slice, &mut out, dataset_size)) }?;
+
+    let costs: Vec<f32> = gpu.dtoh_sync_copy(&out)?;
     
-    let context = Context::create_and_push(
-        ContextFlags::MAP_HOST | ContextFlags::SCHED_AUTO, gpu)?;
-
-    let module_data = CString::new(include_str!("../cuda/img_result.ptx"))?;
-    let module = Module::load_from_string(&module_data)?;
-
-    let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
-
-    let mut result_host = vec![0.0f32; dataset_size];
-
-    let mut img_ptr = DeviceBuffer::from_slice(images.as_slice())?;
-    let mut label_ptr = DeviceBuffer::from_slice(labels.as_slice())?;
-    let mut network_ptr = DeviceBuffer::from_slice(network.as_vec().as_slice())?;
-    let mut cost_ptr = DeviceBuffer::from_slice(result_host.as_slice())?;
-
-    unsafe {
-        launch!(module.img_result<<<1, 30, 0, stream>>>(
-            img_ptr.as_device_ptr(),
-            label_ptr.as_device_ptr(),
-            network_ptr.as_device_ptr(),
-            cost_ptr.as_device_ptr()
-        ))?;
-    }
-
-    stream.synchronize()?;
-
-    let avg = result_host.iter().sum::<f32>() / dataset_size as f32;
-    println!("{}", avg);
-
-    cost_ptr.copy_to(&mut result_host.as_mut_slice())?;
-    
-
-    let avg = result_host.iter().sum::<f32>() / dataset_size as f32;
+    let avg = costs.iter().sum::<f32>() / dataset_size as f32;
 
     Ok(avg)
 }
 
 fn main() {
-    let dataset_size = 30;
+    let dataset_size = 40_000;
     
     let images: IdxFile = IdxFile::load("mnist/train-images.idx3-ubyte");
     let labels: IdxFile = IdxFile::load("mnist/train-labels.idx1-ubyte");
     
     let network: NeuralNetwork = NeuralNetwork::random();
+    
+    let res = cuda_parallelize(images.data, labels.data, &network, dataset_size);
 
-    let avg = cuda_parallelize(&images.data, &labels.data, &network, dataset_size).unwrap();
-
-    println!("{}", avg);
+    println!("{}", res.unwrap());
 
     /* let chunk_size = dataset_size / N_THREADS;
 

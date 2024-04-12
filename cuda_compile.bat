@@ -2,4 +2,4 @@
 
 cd .\cuda\
 
-for %%i in (*.cu) do nvcc -ptx %%i
+for %%i in (*.cu) do nvcc -ptx %%i -g
