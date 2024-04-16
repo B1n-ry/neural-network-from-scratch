@@ -1,17 +1,17 @@
 
-extern "C" __global__ void img_result(const unsigned char* images, const char* labels, const float* network, float* costs, const size_t num_el) {
+extern "C" __global__ void img_result(const unsigned char* images, const char* labels, float* nodes, float* networks, float* costs, const size_t num_el) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (i >= num_el) return;
 
-    /* costs[i] = network[i]; */
+    float* network = networks + (i * (785 * 16 + 17 * 16 + 17 * 10));
 
     const unsigned char* image = images + (i * 784);
     const unsigned char label = labels[i];
 
-    float* layer1_values = new float[16];
-    float* layer2_values = new float[16];
-    float* layer3_values = new float[10];
+    float* layer1_values = nodes + (i * (16 + 16 + 10));
+    float* layer2_values = nodes + (i * (16 + 16 + 10) + 16);
+    float* layer3_values = nodes + (i * (16 + 16 + 10) + 16 + 16);
 
     unsigned int offset = 0;
 
@@ -43,8 +43,14 @@ extern "C" __global__ void img_result(const unsigned char* images, const char* l
     for (unsigned int n = 0; n < 10; n++) {
         costs[i] += pow((float) (n == label) - layer3_values[n], 2);
     }
+}
 
-    delete[] layer1_values;
-    delete[] layer2_values;
-    delete[] layer3_values;
+extern "C" __global__ void copy_network(const float* network, float* network_copy, const size_t network_size, const size_t num_el) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i >= num_el) return;
+
+    for (size_t j = 0; j < network_size; j++) {
+        network_copy[i * network_size + j] = network[j];
+    }
 }

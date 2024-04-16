@@ -1,5 +1,5 @@
-use std::{array::from_fn, error::Error, f32::consts::E, path::Path};
-use cudarc::{driver::{LaunchAsync, LaunchConfig}, nvrtc::Ptx};
+use std::{array::from_fn, error::Error, f32::consts::E};
+use cudarc::{driver::{DeviceSlice, LaunchAsync, LaunchConfig}, nvrtc::Ptx};
 use rand::{rngs::ThreadRng, thread_rng, Rng};
 use idx_parsing::IdxFile;
 
@@ -9,7 +9,7 @@ mod idx_parsing;
 const N_THREADS: usize = 200;
 
 struct NeuralNode<const N: usize> {
-    weights: [f32; N],
+    weights: Box<[f32; N]>,
     bias: f32,
 }
 
@@ -24,7 +24,7 @@ impl<const N: usize> NeuralNode<N> {
         let limit = weights.len() as f32;
 
         NeuralNode {
-            weights: weights,
+            weights: Box::new(weights),
             bias: rng.gen_range(-limit..limit),
         }
     }
@@ -32,9 +32,9 @@ impl<const N: usize> NeuralNode<N> {
 
 struct NeuralNetwork {
     layers: (
-        [NeuralNode<784>; 16],
-        [NeuralNode<16>; 16],
-        [NeuralNode<16>; 10],
+        Box<[NeuralNode<784>; 16]>,
+        Box<[NeuralNode<16>; 16]>,
+        Box<[NeuralNode<16>; 10]>,
     )
 }
 impl NeuralNetwork {
@@ -43,9 +43,9 @@ impl NeuralNetwork {
         
         NeuralNetwork {
             layers: (
-                [(); 16].map(|_| NeuralNode::with_random_weights_and_bias(&mut rng)),
-                [(); 16].map(|_| NeuralNode::with_random_weights_and_bias(&mut rng)),
-                [(); 10].map(|_| NeuralNode::with_random_weights_and_bias(&mut rng)),
+                Box::new([(); 16].map(|_| NeuralNode::with_random_weights_and_bias(&mut rng))),
+                Box::new([(); 16].map(|_| NeuralNode::with_random_weights_and_bias(&mut rng))),
+                Box::new([(); 10].map(|_| NeuralNode::with_random_weights_and_bias(&mut rng))),
             )
         }
     }
@@ -102,24 +102,24 @@ impl NeuralNetwork {
     fn as_vec(&self) -> Vec<f32> {
         let mut vector = vec![];
 
-        for node in &self.layers.0 {
+        for node in self.layers.0.as_ref() {
             vector.push(node.bias);
 
-            for w in node.weights {
+            for w in *node.weights {
                 vector.push(w);
             }
         }
-        for node in &self.layers.1 {
+        for node in self.layers.1.as_ref() {
             vector.push(node.bias);
 
-            for w in node.weights {
+            for w in *node.weights {
                 vector.push(w);
             }
         }
-        for node in &self.layers.2 {
+        for node in self.layers.2.as_ref() {
             vector.push(node.bias);
 
-            for w in node.weights {
+            for w in *node.weights {
                 vector.push(w);
             }
         }
@@ -144,42 +144,53 @@ fn run_once(image: &Vec<u8>, label: u8, network: &NeuralNetwork) -> f32 {
     network.calc_cost(label, &result)
 }
 
-fn cuda_parallelize(images: Vec<u8>, labels: Vec<u8>, network: &NeuralNetwork, dataset_size: usize) -> Result<f32, Box<dyn Error>> {
+fn cuda_parallelize(images: Vec<u8>, labels: Vec<u8>, network: &NeuralNetwork, dataset_size: usize) -> Result<Vec<f32>, Box<dyn Error>> {
+    assert!(images.len() >= dataset_size && labels.len() >= dataset_size);
+
     let gpu = cudarc::driver::CudaDevice::new(0)?;
 
+    let ptx_file = Ptx::from_file("src/cuda/img_result.ptx");
+    gpu.load_ptx(ptx_file, "neural01", &["img_result", "copy_network"])?;
+
+    // Allocate one unique network array/vector with weights and biases for each input
+    let net_instance_local = network.as_vec();
+    let network_size = net_instance_local.len();
+    let network_instance = gpu.htod_sync_copy(net_instance_local.as_slice())?;
+    let mut all_variants = gpu.alloc_zeros::<f32>(dataset_size * network_size)?;
+
+    // Run vector allocation cuda function
+    let copy_network = gpu.get_func("neural01", "copy_network").unwrap();
+    let config = LaunchConfig::for_num_elems(dataset_size as u32);
+    unsafe { copy_network.launch(config, (&network_instance, &mut all_variants, network_size, dataset_size)) }?;
+
     // allocate buffers
-    let image_slice = gpu.htod_copy(images[0..dataset_size].to_vec())?;
-    let label_slice = gpu.htod_copy(labels[0..dataset_size].to_vec())?;
+    let image_slice = gpu.htod_sync_copy(&images[0..(dataset_size * 784)])?;
+    let label_slice = gpu.htod_sync_copy(&labels[0..dataset_size])?;
+    let mut nodes = gpu.alloc_zeros::<f32>((16 + 16 + 10) * dataset_size)?;
 
-    let network_vec = network.as_vec();
-    let network_slice = gpu.htod_copy(network_vec)?;
-    let mut out = gpu.alloc_zeros::<f32>(dataset_size)?;
-
-    let ptx_file = Ptx::from_file("./cuda/img_result.ptx");
-    gpu.load_ptx(ptx_file, "neural01", &["img_result"])?;
+    let mut costs_slice = gpu.alloc_zeros::<f32>(dataset_size)?;
 
     let img_result = gpu.get_func("neural01", "img_result").unwrap();
     let config = LaunchConfig::for_num_elems(dataset_size as u32);
-    unsafe { img_result.launch(config, (&image_slice, &label_slice, &network_slice, &mut out, dataset_size)) }?;
-
-    let costs: Vec<f32> = gpu.dtoh_sync_copy(&out)?;
     
-    let avg = costs.iter().sum::<f32>() / dataset_size as f32;
+    unsafe { img_result.launch(config, (&image_slice, &label_slice, &mut nodes, &all_variants, &mut costs_slice, dataset_size)) }?;
 
-    Ok(avg)
+    let costs: Vec<f32> = gpu.dtoh_sync_copy(&costs_slice)?;
+
+    Ok(costs)
 }
 
 fn main() {
-    let dataset_size = 40_000;
+    let dataset_size = 60_000;
     
     let images: IdxFile = IdxFile::load("mnist/train-images.idx3-ubyte");
     let labels: IdxFile = IdxFile::load("mnist/train-labels.idx1-ubyte");
     
     let network: NeuralNetwork = NeuralNetwork::random();
     
-    let res = cuda_parallelize(images.data, labels.data, &network, dataset_size);
-
-    println!("{}", res.unwrap());
+    let res = cuda_parallelize(images.data, labels.data, &network, dataset_size).unwrap();
+    println!("Network cost: {}", res.iter().sum::<f32>() / res.len() as f32);
+    
 
     /* let chunk_size = dataset_size / N_THREADS;
 

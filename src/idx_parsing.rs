@@ -9,10 +9,10 @@ pub struct IdxFile {
 }
 impl IdxFile {
     pub fn load(path: &str) -> IdxFile {
-        let buf: &mut Vec<u8> = &mut vec![];
+        let mut buf: Vec<u8> = vec![];
 
-        let mut file = File::open(path).unwrap();
-        file.read_to_end(buf).unwrap();
+        let mut file = Box::new(File::open(path).unwrap());
+        file.read_to_end(&mut buf).unwrap();
 
         let data_type: u8 = buf[2];
         let data_size: u8 = match data_type {

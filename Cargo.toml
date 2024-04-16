@@ -10,3 +10,7 @@ rand = "0.8.5"
 rayon = "1.10.0"
 itertools = "0.12.1"
 cudarc = "0.10.0"
+
+[env]
+RUST_BACKTRACE=1
+CUDA_LAUNCH_BLOCKING=1

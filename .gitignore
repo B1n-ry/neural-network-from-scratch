@@ -1,3 +1,12 @@
+# No target
 /target
-/.vscode
+
+# No idx data files within the mnist folder
 /mnist/*.idx?-ubyte
+
+# No temp files/filders
+*temp[._- ]*
+
+# No hidden files/fidlers
+/.*
+*/.*
