@@ -1,5 +1,5 @@
-use std::{array::from_fn, error::Error, f32::consts::E};
-use cudarc::{driver::{DeviceSlice, LaunchAsync, LaunchConfig}, nvrtc::Ptx};
+use std::{array::from_fn, error::Error, f32::consts::E, ops::SubAssign, sync::Arc};
+use cudarc::{driver::{CudaDevice, LaunchAsync, LaunchConfig}, nvrtc::Ptx};
 use rand::{rngs::ThreadRng, thread_rng, Rng};
 use idx_parsing::IdxFile;
 
@@ -64,7 +64,7 @@ impl NeuralNetwork {
                 .sum::<f32>();
             *val += node.bias;
     
-            *val = signmoid(*val);
+            *val = sigmoid(*val);
         }
         for (node, val) in &mut self.layers.1.iter().zip(&mut node_values.1) {
             *val = node_values.0.iter()
@@ -73,7 +73,7 @@ impl NeuralNetwork {
                 .sum::<f32>();
             *val += node.bias;
     
-            *val = signmoid(*val);
+            *val = sigmoid(*val);
         }
         for (node, val) in &mut self.layers.2.iter().zip(&mut node_values.2) {
             *val = node_values.1.iter()
@@ -82,7 +82,7 @@ impl NeuralNetwork {
                 .sum::<f32>();
             *val += node.bias;
     
-            *val = signmoid(*val);
+            *val = sigmoid(*val);
         }
 
         node_values.2
@@ -128,7 +128,7 @@ impl NeuralNetwork {
     }
 }
 
-fn signmoid(i: f32) -> f32 {
+fn sigmoid(i: f32) -> f32 {
     1.0 / (1.0 + E.powf(-i))
 }
 
@@ -144,40 +144,90 @@ fn run_once(image: &Vec<u8>, label: u8, network: &NeuralNetwork) -> f32 {
     network.calc_cost(label, &result)
 }
 
-fn cuda_parallelize(images: Vec<u8>, labels: Vec<u8>, network: &NeuralNetwork, dataset_size: usize) -> Result<Vec<f32>, Box<dyn Error>> {
+fn squish(x: f32) -> f32 {
+    x / (1.0 + x.powi(2)).sqrt()
+}
+
+fn alter_network(network: &mut NeuralNetwork, gradient: &Vec<f32>) {
+    let mut i = 0;
+    for l in &mut *network.layers.0 {
+        l.bias.sub_assign(gradient[i]); i += 1;
+        for w in &mut *l.weights {
+            w.sub_assign(gradient[i]); i += 1;
+        }
+    }
+    for l in &mut *network.layers.1 {
+        l.bias.sub_assign(gradient[i]); i += 1;
+        for w in &mut *l.weights {
+            w.sub_assign(gradient[i]); i += 1;
+        }
+    }
+    for l in &mut *network.layers.2 {
+        l.bias.sub_assign(gradient[i]); i += 1;
+        for w in &mut *l.weights {
+            w.sub_assign(gradient[i]); i += 1;
+        }
+    }
+}
+
+fn run_cuda(images: &Vec<u8>, labels: &Vec<u8>, network: &mut NeuralNetwork, dataset_size: usize) -> Result<(), Box<dyn Error>> {
     assert!(images.len() >= dataset_size && labels.len() >= dataset_size);
 
     let gpu = cudarc::driver::CudaDevice::new(0)?;
 
     let ptx_file = Ptx::from_file("src/cuda/img_result.ptx");
-    gpu.load_ptx(ptx_file, "neural01", &["img_result", "copy_network"])?;
+    gpu.load_ptx(ptx_file, "neural01", &["img_result", "backpropagation", "average_gradient"])?;
+    
+    let res = cuda_parallelize(&gpu, &images, &labels, &network, dataset_size)?;
+    let mut cost = res.0.iter().sum::<f32>() / res.0.len() as f32;
+    println!("Network cost: {}", cost);
 
+    while cost > 0.5 {
+        alter_network(network, &res.1);
+        
+        let res = cuda_parallelize(&gpu, &images, &labels, &network, dataset_size)?;
+        cost = res.0.iter().sum::<f32>() / res.0.len() as f32;
+        println!("Network cost: {}", cost);
+    }
+
+    Ok(())
+}
+
+fn cuda_parallelize(gpu: &Arc<CudaDevice>, images: &Vec<u8>, labels: &Vec<u8>, network: &NeuralNetwork, dataset_size: usize) -> Result<(Vec<f32>, Vec<f32>), Box<dyn Error>> {
     // Allocate one unique network array/vector with weights and biases for each input
     let net_instance_local = network.as_vec();
     let network_size = net_instance_local.len();
-    let network_instance = gpu.htod_sync_copy(net_instance_local.as_slice())?;
-    let mut all_variants = gpu.alloc_zeros::<f32>(dataset_size * network_size)?;
+    let network_instance = gpu.htod_sync_copy(net_instance_local.as_slice())?;  // Current network in training
+    
+    let image_slice = gpu.htod_sync_copy(&images[0..(dataset_size * 784)])?;  // All images trained on
+    let label_slice = gpu.htod_sync_copy(&labels[0..dataset_size])?;  // Labels for each image trained on
+    let mut nodes = gpu.alloc_zeros::<f32>((16 + 16 + 10) * dataset_size)?;  // Allocated memory for the CUDA code to store node values in
 
-    // Run vector allocation cuda function
-    let copy_network = gpu.get_func("neural01", "copy_network").unwrap();
-    let config = LaunchConfig::for_num_elems(dataset_size as u32);
-    unsafe { copy_network.launch(config, (&network_instance, &mut all_variants, network_size, dataset_size)) }?;
-
-    // allocate buffers
-    let image_slice = gpu.htod_sync_copy(&images[0..(dataset_size * 784)])?;
-    let label_slice = gpu.htod_sync_copy(&labels[0..dataset_size])?;
-    let mut nodes = gpu.alloc_zeros::<f32>((16 + 16 + 10) * dataset_size)?;
-
-    let mut costs_slice = gpu.alloc_zeros::<f32>(dataset_size)?;
+    let mut costs_slice = gpu.alloc_zeros::<f32>(dataset_size)?;  // Costs for each training example in the current network
 
     let img_result = gpu.get_func("neural01", "img_result").unwrap();
     let config = LaunchConfig::for_num_elems(dataset_size as u32);
-    
-    unsafe { img_result.launch(config, (&image_slice, &label_slice, &mut nodes, &all_variants, &mut costs_slice, dataset_size)) }?;
+
+    unsafe { img_result.launch(config, (&image_slice, &label_slice, &network_instance, &mut nodes, &mut costs_slice, dataset_size)) }?;
 
     let costs: Vec<f32> = gpu.dtoh_sync_copy(&costs_slice)?;
 
-    Ok(costs)
+
+    // Calculate derivitives
+    let mut derivatives = gpu.alloc_zeros::<f32>(dataset_size * network_size)?;  // Will be overwritten by derivatives for each weight/bias
+    let backpropagation = gpu.get_func("neural01", "backpropagation").unwrap();
+    unsafe { backpropagation.launch(config, (&network_instance, &nodes, &image_slice, &label_slice, &mut derivatives, dataset_size)) }?;
+
+
+    // Calculate average derivitives
+    let mut avg_gradient = gpu.alloc_zeros::<f32>(network_size)?;
+    let calc_avg_gradient = gpu.get_func("neural01", "average_gradient").unwrap();
+    let config = LaunchConfig::for_num_elems(network_size as u32);
+    unsafe { calc_avg_gradient.launch(config, (&derivatives, &mut avg_gradient, dataset_size, network_size)) }?;
+
+    let gradient_descent = gpu.dtoh_sync_copy(&avg_gradient)?;
+
+    Ok((costs, gradient_descent))
 }
 
 fn main() {
@@ -186,12 +236,10 @@ fn main() {
     let images: IdxFile = IdxFile::load("mnist/train-images.idx3-ubyte");
     let labels: IdxFile = IdxFile::load("mnist/train-labels.idx1-ubyte");
     
-    let network: NeuralNetwork = NeuralNetwork::random();
-    
-    let res = cuda_parallelize(images.data, labels.data, &network, dataset_size).unwrap();
-    println!("Network cost: {}", res.iter().sum::<f32>() / res.len() as f32);
+    let mut network: NeuralNetwork = NeuralNetwork::random();
     
 
+    run_cuda(&images.data, &labels.data, &mut network, dataset_size).unwrap();
     /* let chunk_size = dataset_size / N_THREADS;
 
     let mut all_data: Vec<(f32, Vec<u8>, u8)> = izip!(
